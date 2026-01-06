@@ -173,3 +173,210 @@ export function findBestRW({ volumeL, productId, slotStart, slotEnd, events, can
 
   return best;
 }
+// --------------------------------------------------------
+// NORMALIZER + VALIDATOR (Merge-Gate Schritt 4)
+// --------------------------------------------------------
+
+const LANE_TYPE_ORDER = { LINE: 0, RW: 1, IBC: 2 };
+const TYPE_PRIORITY = {
+  // feste Reihenfolge, damit Sorting stabil bleibt
+  lineFill: 10,
+  rwBatch: 20,
+  "rw-slot": 20,
+  ibcBatch: 30,
+  cleaning: 40,
+  blocked: 50,
+  unknown: 99
+};
+
+function clamp0(n) {
+  return n < 0 ? 0 : n;
+}
+
+export function quantFloor(t, stepMin) {
+  return Math.floor(t / stepMin) * stepMin;
+}
+
+export function quantCeil(t, stepMin) {
+  return Math.ceil(t / stepMin) * stepMin;
+}
+
+// deterministischer Hash (FNV-1a)
+function fnv1a(str) {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i);
+    h = (h + (h << 1) + (h << 4) + (h << 7) + (h << 8) + (h << 24)) >>> 0;
+  }
+  return ("00000000" + h.toString(16)).slice(-8);
+}
+
+function canonicalLane(e) {
+  // already canonical?
+  if (e.laneType && e.laneId) return { laneType: e.laneType, laneId: e.laneId };
+
+  // legacy: lane string
+  const lane = e.lane || e.laneId || "";
+  if (/^Linie\d+$/.test(lane)) {
+    const n = lane.replace("Linie", "");
+    return { laneType: "LINE", laneId: `L${n}` };
+  }
+  if (lane === "IBC") return { laneType: "IBC", laneId: "IBC" };
+
+  // sonst: RW (A1, RW09, ...)
+  return { laneType: "RW", laneId: lane };
+}
+
+function typePriority(type) {
+  return TYPE_PRIORITY[type] ?? TYPE_PRIORITY.unknown;
+}
+
+function canonicalSort(a, b) {
+  const ao = LANE_TYPE_ORDER[a.laneType] ?? 99;
+  const bo = LANE_TYPE_ORDER[b.laneType] ?? 99;
+  if (ao !== bo) return ao - bo;
+
+  if (a.laneId !== b.laneId) return String(a.laneId).localeCompare(String(b.laneId));
+
+  if (a.qStart !== b.qStart) return a.qStart - b.qStart;
+  if (a.qEnd !== b.qEnd) return a.qEnd - b.qEnd;
+
+  const ap = typePriority(a.type);
+  const bp = typePriority(b.type);
+  if (ap !== bp) return ap - bp;
+
+  return String(a.id).localeCompare(String(b.id));
+}
+
+export function normalizeEvents(rawEvents, cfg) {
+  const stepMin = Number(cfg?.stepMin ?? 5);
+  const diagnostics = [];
+
+  const arr = Array.isArray(rawEvents) ? rawEvents : [];
+  const normalized = arr.map((src, idx) => {
+    const e = { ...src };
+
+    // lane canonical
+    const { laneType, laneId } = canonicalLane(e);
+    e.laneType = laneType;
+    e.laneId = laneId;
+
+    // type canonical (falls bei manchen Events nicht gesetzt)
+    if (!e.type) {
+      // Fallback: alte Labels erkennen (optional)
+      if (e.label?.startsWith("Abfüllung")) e.type = "lineFill";
+      else e.type = "unknown";
+    }
+
+    // times
+    const start = Number(e.start ?? 0);
+    const end = Number(e.end ?? start);
+    e.start = Number.isFinite(start) ? start : 0;
+    e.end = Number.isFinite(end) ? end : e.start;
+
+    // quantize conservative
+    e.qStart = clamp0(quantFloor(e.start, stepMin));
+    e.qEnd = clamp0(quantCeil(e.end, stepMin));
+    if (e.qEnd < e.qStart + stepMin) e.qEnd = e.qStart + stepMin;
+
+    // deterministic id if missing
+    if (!e.id) {
+      const base = [
+        e.type,
+        e.laneType,
+        e.laneId,
+        e.productId ?? e.product ?? "",
+        e.orderId ?? "",
+        e.volumeL ?? e.volume ?? "",
+        e.qStart,
+        e.qEnd,
+        e.lockKind ?? ""
+      ].join("|");
+      e.id = `${e.type}_${fnv1a(base)}_${idx}`;
+    }
+
+    return e;
+  });
+
+  normalized.sort(canonicalSort);
+
+  return { events: normalized, diagnostics };
+}
+
+// Welche Events blockieren RW?
+function blocksRW(e) {
+  // RW-Lane: fast alles blockiert – außer reine Anzeigeobjekte
+  // (lineFill liegt auf LINE laneType, ibcBatch auf IBC)
+  if (e.laneType !== "RW") return false;
+  if (e.type === "lineFill") return false;
+  return true;
+}
+
+export function validatePlan(events, cfg) {
+  const diagnostics = [];
+  const stepMin = Number(cfg?.stepMin ?? 5);
+
+  const arr = Array.isArray(events) ? events : [];
+
+  // basic invariants
+  for (const e of arr) {
+    if (!e.laneType || !e.laneId) {
+      diagnostics.push({ code: "LANE_NOT_CANONICAL", eventId: e.id });
+    }
+    if (!Number.isFinite(e.qStart) || !Number.isFinite(e.qEnd)) {
+      diagnostics.push({ code: "QTIMES_INVALID", eventId: e.id });
+    } else if (e.qEnd < e.qStart + stepMin) {
+      diagnostics.push({ code: "QTIMES_TOO_SHORT", eventId: e.id, qStart: e.qStart, qEnd: e.qEnd });
+    }
+  }
+
+  // RW overlap check (qTimes only)
+  const byRW = new Map();
+  for (const e of arr) {
+    if (!blocksRW(e)) continue;
+    const key = e.laneId;
+    if (!byRW.has(key)) byRW.set(key, []);
+    byRW.get(key).push(e);
+  }
+
+  for (const [rwId, list] of byRW.entries()) {
+    list.sort((a, b) => (a.qStart - b.qStart) || (a.qEnd - b.qEnd) || String(a.id).localeCompare(String(b.id)));
+    for (let i = 1; i < list.length; i++) {
+      const prev = list[i - 1];
+      const cur = list[i];
+      if (cur.qStart < prev.qEnd) {
+        diagnostics.push({
+          code: "RW_OVERLAP",
+          rwId,
+          a: prev.id,
+          b: cur.id,
+          window: { a: [prev.qStart, prev.qEnd], b: [cur.qStart, cur.qEnd] }
+        });
+      }
+    }
+  }
+
+  return { ok: diagnostics.length === 0, diagnostics };
+}
+
+export function computePlanHash(events) {
+  const arr = Array.isArray(events) ? events : [];
+  const parts = arr.map(e => {
+    const consumers = Array.isArray(e.consumers)
+      ? [...e.consumers].sort((a, b) => String(a.orderId).localeCompare(String(b.orderId)))
+      : [];
+    return [
+      e.id,
+      e.laneType,
+      e.laneId,
+      e.qStart,
+      e.qEnd,
+      e.type,
+      e.productId ?? e.product ?? "",
+      e.volumeL ?? e.volume ?? "",
+      e.lockKind ?? "",
+      JSON.stringify(consumers)
+    ].join(",");
+  });
+  return fnv1a(parts.join("\n"));
+}
